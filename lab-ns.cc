@@ -54,8 +54,6 @@
  #include <deal.II/sundials/arkode.h>
 
 
-  #include <fstream>
-  #include <iostream>
 
 namespace IMEX_NS
 {
@@ -165,7 +163,7 @@ namespace IMEX_NS
       ,is_linear(true)
       ,is_time_ind(true)
       ,max_nonlinear_iterations(10)
-      ,max_order_arkode(5)
+      ,max_order_arkode(3)
       ,minimum_step_size(1e-6)
       ,arkode_data()
       {arkode_data.implicit_function_is_linear          = true;  
@@ -174,7 +172,9 @@ arkode_data.relative_tolerance                   = 1e-6;
 arkode_data.absolute_tolerance                   = 1e-9;
 arkode_data.initial_time = 0.0;
 arkode_data.final_time = 2.0;
+arkode_data.mass_is_time_independent = true;
 
+arkode_data.maximum_order = 5;
 
       }     
       
@@ -341,7 +341,7 @@ dsp.collect_sizes();
 DoFTools::make_sparsity_pattern(dof_handler,
                                 dsp,
                                 homogeneous_constraints,
-                                /*keep_constrained_dofs=*/false);
+                                /*keep_constrained_dofs=*/true);
 
 
   BlockSparsityPattern bsp;
@@ -368,7 +368,7 @@ void NavierStokes<dim>::setup_arkode(  SUNDIALS::ARKode<BlockVector<double>> &ar
 {  arkode.implicit_function = [&] (const double t, const BlockVector<double> &y, BlockVector<double> &ydot)
   {
      system_matrix.vmult(ydot,y);
-    ydot *= -1.0;
+    
    
     
   };
@@ -406,6 +406,11 @@ void NavierStokes<dim>::setup_arkode(  SUNDIALS::ARKode<BlockVector<double>> &ar
       SUNDIALS::SundialsPreconditioner<BlockVector<double>> &,
       BlockVector<double> &x, const BlockVector<double> &b, double)
       { x=0.0;
+        /*  SolverControl control(1000,1e-6);
+        SolverCG<Vector<double>> cg_solver(control);
+        cg_solver.solve(mass_matrix.block(0,0), x.block(0), b.block(0), PreconditionIdentity()); */
+
+        
       
        SparseMatrix<double> &Bs=system_matrix.block(1,0);
         SparseMatrix<double> &As = system_matrix.block(0,0);
@@ -421,9 +426,9 @@ void NavierStokes<dim>::setup_arkode(  SUNDIALS::ARKode<BlockVector<double>> &ar
         dealii::SparseDirectUMFPACK solver;
 
 
-
-        cg_solver.solve(mass_matrix.block(0,0), x.block(0), b.block(0), PreconditionIdentity());
-        
+        Vector<double> xcop;
+        cg_solver.solve(mass_matrix.block(0,0), xcop, b.block(0), PreconditionIdentity());
+        x.block(0)=xcop;
 auto Minv= inverse_operator(M, cg_solver);
 
 auto B   = linear_operator(system_matrix.block(1,0));
@@ -432,7 +437,7 @@ auto A = linear_operator(system_matrix.block(0,0));
 auto S = B * Minv * Bt;
 Vector<double> u_rhs(n_u);
 
- A.vmult(u_rhs,x.block(0)); 
+ A.vmult(u_rhs,xcop); 
 u_rhs +=system_rhs.block(0);
 
 auto B_tmp = B*Minv;
@@ -440,7 +445,7 @@ Vector<double> b1(n_p);
 B_tmp.vmult(b1,u_rhs);
 b1 *= -1.0;
 auto Sinv = inverse_operator(S, cg_solver);
-S.vmult(x.block(1),b1);
+Sinv.vmult(x.block(1),b1);
 
 
        
@@ -449,14 +454,14 @@ S.vmult(x.block(1),b1);
   
      
       
-    /* arkode.mass_times_vector = [&](const double , 
+    
+       arkode.solve_mass = solve_mass_closed; 
+       arkode.mass_times_vector = [&](const double , 
                                      const BlockVector<double> &v,
                                     BlockVector<double> &Mv){ 
-                                      Mv = 0.0;
-  mass_matrix.block(0,0).vmult(Mv.block(0), v.block(0));
-  Mv.block(1) = 0.0;
-                                    };*/
-       arkode.solve_mass = solve_mass_closed;
+                                     mass_matrix.vmult(Mv,v);
+                                    
+                                    };
        }
 template <int dim>
 void NavierStokes<dim>::run()
@@ -524,8 +529,9 @@ while (time < final_time - 1e-14)
   const double target_time = std::min(next_output_time, final_time);
   std::cout << target_time << std::endl;
 
-  arkode.solve_ode_incrementally(solution, target_time, true); //qui qualcosa non va
-  
+  arkode.solve_ode_incrementally(solution, target_time, false); //qui qualcosa non va
+
+
   
   need_reset = false;
 
