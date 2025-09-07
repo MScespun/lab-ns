@@ -15,6 +15,8 @@
   #include <deal.II/lac/sparsity_tools.h>
   #include <deal.II/lac/sparse_matrix.h>
   #include <deal.II/base/discrete_time.h>
+  #include <deal.II/sundials/ida.h>
+  #include <deal.II/lac/sparse_ilu.h>
 
   #include <deal.II/lac/petsc_vector.h>
   #include <deal.II/lac/petsc_sparse_matrix.h>
@@ -99,20 +101,19 @@ namespace IMEX_NS
                          const unsigned int timestep_number,
                          const Vector<double> &solution);
 
-      void prepare_for_coarsening_and_refinement(const PETScWrappers::VectorBase &solution);
-      void transfer_solution_vectors_to_new_mesh(const double time, const std::vector<Vector<double>> &all_in, std::vector<Vector<double>> &all_out); 
-      void assemble_matrix(const double time);
-      void assemble_convective_rhs_from(const Vector<double> &y,
-                                       Vector<double> &rhs);
+      void prepare_for_coarsening_and_refinement(const Vector<double> &solution);
+      void transfer_solution_vectors_to_new_mesh(const double time, Vector<double> &y, Vector<double> &y_dot); 
       
       void update_current_constraints(const double time);
+
+      void compute_stokes_initial_guess(Vector<double> &y, Vector<double> &y_dot);
 
       AffineConstraints<double> hanging_node_constraints;
       AffineConstraints<double> current_constraints;
       AffineConstraints<double> homogeneous_constraints;
       AffineConstraints<double> pressure_boundary_constraints;
 
-      BlockSparsityPattern sparsisty_pattern_;
+      SparsityPattern jac_sparsity_;
 
 
 
@@ -122,12 +123,12 @@ namespace IMEX_NS
       SUNDIALS::ARKode<dealii::BlockVector<double>>::AdditionalData arkode_data;
 
 
-      double final_time;
+      
       double initial_time;
       double time_interval_output;
       double abs_tol;
       double rel_tol;
-      bool is_linear;
+      
       bool is_time_ind;
       unsigned int max_nonlinear_iterations;
       unsigned int max_order_arkode;
@@ -136,30 +137,30 @@ namespace IMEX_NS
 
       unsigned int initial_global_refinement;
       unsigned int max_delta_refinement_level;
-      unsigned int mesh_adaptation_frequency;
 
       SparseMatrix<double> system_matrix;
       SparseMatrix<double> mass_matrix;
       Vector<double> system_rhs;
       Vector<double> solution;
-      PETScWrappers::SparseMatrix jacobian_matrix;
+      SparseMatrix<double> jacobian_matrix;
 
-      PETScWrappers::TimeStepperData time_stepper_data;
+      
 
-      void implicit_function(const double time,
-                             const PETScWrappers::VectorBase &solution,
-                             const PETScWrappers::VectorBase &solution_dot,
-                             PETScWrappers::VectorBase &F);
-      void assemble_implicit_jacobian(const double time,
-                                      const PETScWrappers::VectorBase &solution,
-                                     const PETScWrappers::VectorBase &solution_dot,
+      void residual(const double time,
+                    const Vector<double> &solution,
+                             const Vector<double> &solution_dot,
+                             Vector<double> &F);
+      void assemble_jacobian(const double time,
+                                      const Vector<double> &solution,
+                                     const Vector<double> &solution_dot,
                                     const double shift);
-      void assemble_explicit_jacobian(const double time, 
-                                      const PETScWrappers::VectorBase &solution);
-      void explicit_function(const double time, const PETScWrappers::VectorBase &solution, 
-                             PETScWrappers::VectorBase &G);
-      void solve_with_jacobian( const PETScWrappers::VectorBase &src,
-                                PETScWrappers::VectorBase       &residual);
+      
+      void solve_with_jacobian( const Vector<double> &src,
+                                Vector<double>       &residual,
+                                const double tol);
+      unsigned int threshold_refine;
+      SUNDIALS::IDA<Vector<double>>::AdditionalData data_ida;
+      double current_time_for_logs = std::numeric_limits<double>::quiet_NaN();
 
      
 
@@ -174,35 +175,31 @@ namespace IMEX_NS
                    Triangulation<dim>::smoothing_on_coarsening))
       , fe(FE_Q<dim>(2),dim, FE_Q<dim>(1),1)
       , dof_handler(triangulation)
-      ,initial_global_refinement(2) 
+      ,initial_global_refinement(1) 
       ,max_delta_refinement_level(2) 
-      , mesh_adaptation_frequency(10)
-      ,final_time(1.0)
+  
       ,initial_time(0.0)
       ,time_interval_output(0.1)
       ,abs_tol(1e-6)
       ,rel_tol(1e-6)
-      ,is_linear(true)
+      ,threshold_refine(1)
+   
       ,is_time_ind(true)
       ,max_nonlinear_iterations(10)
       ,max_order_arkode(3)
       ,minimum_step_size(1e-6)
-      ,time_stepper_data("",
-                          "beuler",
-                          /* start time */ 0.0,
-                          /* end time */ 1.0,
-                          /* initial time step */ 0.025)
-      ,arkode_data()
-      {arkode_data.implicit_function_is_linear          = true;  
-arkode_data.implicit_function_is_time_independent= true;   
-arkode_data.relative_tolerance                   = 1e-6;   
-arkode_data.absolute_tolerance                   = 1e-9;
-arkode_data.initial_time = 0.0;
-arkode_data.final_time = 2.0;
-arkode_data.mass_is_time_independent = true;
-
-arkode_data.maximum_order = 2;
-
+      , data_ida()
+      {
+       data_ida.initial_time = 0.0;
+       data_ida.final_time = 10.0;
+       data_ida.initial_step_size = 0.01;
+       data_ida.minimum_step_size = 0.001;
+       data_ida.absolute_tolerance = 1e-6;
+       data_ida.relative_tolerance = 1e-4;
+       data_ida.output_period = 0.1;
+       data_ida.ic_type = SUNDIALS::IDA<Vector<double>>::AdditionalData::use_y_diff;
+       data_ida.reset_type  = SUNDIALS::IDA<Vector<double>>::AdditionalData::use_y_diff;
+       data_ida.maximum_non_linear_iterations_ic = 10;
       }     
       
       
@@ -220,8 +217,7 @@ void NavierStokes<dim>::output_results(const double time,
   data_out.set_flags(vtk_flags);
 
   std::vector<std::string> names;
-  for (unsigned int d=0; d<dim; ++d)
-    names.emplace_back(std::string("u_") + (d==0?"x":"y"));
+  names = std::vector<std::string>(dim, "u");
   names.emplace_back("p");
 
   std::vector<DataComponentInterpretation::DataComponentInterpretation> interp;
@@ -256,6 +252,10 @@ void NavierStokes<dim>::output_results(const double time,
     void NavierStokes<dim>::setup_system(const double time)
     { 
       dof_handler.distribute_dofs(fe);
+        std::vector<unsigned int> block_comp(fe.n_components(), 0);
+for (unsigned int c = 0; c < dim; ++c) block_comp[c] = 0; 
+block_comp[dim] = 1;                                      
+DoFRenumbering::component_wise(dof_handler, block_comp);
       std::cout << std::endl
             << "Number of active cells: " << triangulation.n_active_cells()
             << std::endl
@@ -284,65 +284,28 @@ void NavierStokes<dim>::output_results(const double time,
 
   VectorTools::interpolate_boundary_values(dof_handler, 1,
       Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints, vel_mask);
-  VectorTools::interpolate_boundary_values(dof_handler, 3,
+  VectorTools::interpolate_boundary_values(dof_handler, 4,
       Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints, vel_mask);
 
-  VectorTools::interpolate_boundary_values(dof_handler, 4,
-      Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints, uy_mask);
+  
 
-  VectorTools::interpolate_boundary_values(dof_handler, 4,
-      Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints,
-      fe.component_mask(pressure));
-
-  homogeneous_constraints.close();
-
-  update_current_constraints(time);
-
+  
+IndexSet p_dofs(dof_handler.n_dofs());
+p_dofs.add_indices(DoFTools::extract_dofs(dof_handler, fe.component_mask(pressure)));
+types::global_dof_index p0 = *p_dofs.begin();  
+homogeneous_constraints.add_line(p0);
+homogeneous_constraints.set_inhomogeneity(p0, 0.0);
+homogeneous_constraints.close();
 
 
-      /* for (const auto &boundary_id:boundary_ids)
-      { 
-        switch (boundary_id)
-                {
-                  case 1:
-                    VectorTools::interpolate_boundary_values(
-                      dof_handler,
-                      boundary_id,
-                      Functions::ZeroFunction<dim>(),
-                      homogeneous_constraints,
-                      fe.component_mask(velocities));
-                    break;
-                  case 2:
-                    
-                    break;
-                  case 3:
-                    
-                      VectorTools::interpolate_boundary_values(
-                        dof_handler,
-                        boundary_id,
-                        Functions::ZeroFunction<dim>(),
-                        homogeneous_constraints,
-                        fe.component_mask(velocities));
-                    break;
-                  case 4:
-                    VectorTools::interpolate_boundary_values(
-                      dof_handler,
-                      boundary_id,
-                      Functions::ZeroFunction<dim>(),
-                      homogeneous_constraints,
-                      fe.component_mask(velocities));
-                    break;
-                  default:
-                    AssertThrow(false, ExcMessage("Wrong boundary id"));
-                    break;
-                }
-      } */
+ 
+
+
+
+    
 
       
-      std::vector<unsigned int> block_comp(fe.n_components(), 0);
-for (unsigned int c = 0; c < dim; ++c) block_comp[c] = 0; 
-block_comp[dim] = 1;                                      
-DoFRenumbering::component_wise(dof_handler, block_comp);
+    
 
 const auto dofs_per_block = DoFTools::count_dofs_per_fe_block(dof_handler, block_comp);
 const unsigned int n_u = dofs_per_block[0];
@@ -350,11 +313,13 @@ const unsigned int n_p = dofs_per_block[1];
 const unsigned int n_dofs = dof_handler.n_dofs();
 
 DynamicSparsityPattern dsp(n_dofs);
-DoFTools::make_sparsity_pattern(dof_handler, dsp,homogeneous_constraints, /*keep_constrained_dofs=*/false);
+update_current_constraints(time);
+DoFTools::make_sparsity_pattern(dof_handler, dsp,current_constraints, /*keep_constrained_dofs=*/true);
 
 
+jac_sparsity_.copy_from(dsp);
 jacobian_matrix.clear();
-jacobian_matrix.reinit(dsp);
+jacobian_matrix.reinit(jac_sparsity_);
 
 }
 
@@ -376,89 +341,83 @@ void NavierStokes<dim>::run()
 
  
   setup_system(initial_time);
- // assemble_matrix(initial_time);
+ 
 
+  SUNDIALS::IDA<Vector<double>> time_stepper(data_ida);
   
- // solution = 0.0;
 
-
-  
-   
-  //SUNDIALS::ARKode<BlockVector<double>> arkode(arkode_data);
-  //setup_arkode(arkode);
-  
-  PETScWrappers::TimeStepper<PETScWrappers::VectorBase, PETScWrappers::SparseMatrix> petsc_ts(time_stepper_data);
-  
-  petsc_ts.set_matrices(jacobian_matrix,jacobian_matrix);
-
-  petsc_ts.implicit_function = [&](const double time,
-                                   const PETScWrappers::VectorBase &y,
-                                   const PETScWrappers::VectorBase &y_dot,
-                                   PETScWrappers::VectorBase &F)
-                                   {this->implicit_function(time, y, y_dot, F);};
-  petsc_ts.setup_jacobian = [&](const double time,
-                                const PETScWrappers::VectorBase &y,
-                               const PETScWrappers::VectorBase &y_dot,
-                               const double alpha){
-                                this-> assemble_implicit_jacobian(time, y, y_dot, alpha);
+time_stepper.residual = [&](const double time,
+                                   const Vector<double> &y,
+                                   const Vector<double> &y_dot,
+                                   Vector<double> &F)
+                                   {current_time_for_logs = time;
+                                    this->residual(time, y, y_dot, F);};
+  time_stepper.setup_jacobian = [&](const double time,
+                                const Vector<double> &y,
+                               const Vector<double> &y_dot,
+                               const double alpha){current_time_for_logs = time;
+                                this-> assemble_jacobian(time, y, y_dot, alpha);
                                };
-  petsc_ts.explicit_function = [&](const double time,
-                                  const PETScWrappers::VectorBase &y,
-                                  PETScWrappers::VectorBase &G)
-                                  {this-> explicit_function(time, y, G);};
   
-   petsc_ts.solve_with_jacobian = [&](const  PETScWrappers::VectorBase &src,
-                                         PETScWrappers::VectorBase       &dst) {
-        this->solve_with_jacobian(src, dst);
+  time_stepper.solve_with_jacobian = [&](const  Vector<double> &src,
+                                         Vector<double>       &dst,
+                                        const double tol) {
+                                          std::cout<< current_time_for_logs<<std::endl;
+        this->solve_with_jacobian(src, dst,tol);
       };
+    time_stepper.output_step = [&](const double t,
+                                    const Vector<double> &y,
+                                   const Vector<double> &y_dot,
+                                  const unsigned int step_number)
+                                  {Vector<double> vis = y;
+  update_current_constraints(t);
+  current_constraints.distribute(vis);    
+  std::cout << " step: "<< step_number <<"t= " << t << "  ||y||_inf=" << y.linfty_norm() << std::endl;
+  this->output_results(t, step_number, vis); };
 
-  petsc_ts.algebraic_components = [&]()
-  {
-    IndexSet algebraic_set(dof_handler.n_dofs());
-    algebraic_set.add_indices(DoFTools::extract_boundary_dofs(dof_handler));
-    algebraic_set.add_indices((DoFTools::extract_hanging_node_dofs(dof_handler)));
-    return algebraic_set;
-  };
 
-  petsc_ts.distribute =
-        [&](const double time, PETScWrappers::VectorBase &y) {
-          
-          update_current_constraints(time);
+    time_stepper.solver_should_restart = [&](const double time,
+                                             Vector<double> &y,
+                                             Vector<double> &y_dot)
+   {
+     if(time>= 20*threshold_refine)
+     {threshold_refine ++;
+      update_current_constraints(time);
           current_constraints.distribute(y);
-        };
-  
-   petsc_ts.decide_and_prepare_for_remeshing =
-        [&](const double /* time */,
-            const unsigned int                step_number,
-            const PETScWrappers::VectorBase &y) -> bool {
-        if (step_number > 0 && this->mesh_adaptation_frequency > 0 &&
-            step_number % this->mesh_adaptation_frequency == 0)
-          {
-            std::cout << std::endl << "Adapting the mesh..." << std::endl;
+          std::cout << std::endl << "Adapting the mesh..." << std::endl;
             this->prepare_for_coarsening_and_refinement(y);
+            this->transfer_solution_vectors_to_new_mesh(time, y, y_dot);
             return true;
-          }
-        else
-          return false;
-      };
+
+
+     }
+     else
+     return false;
+                                             };
+
+
+ time_stepper.differential_components = [&]()
+ {  IndexSet diff(dof_handler.n_dofs());
+    const FEValuesExtractors::Vector velocities(0);
+    diff.add_indices(DoFTools::extract_dofs(dof_handler,fe.component_mask(velocities)));
+
   
-      petsc_ts.transfer_solution_vectors_to_new_mesh =
-        [&](const double                                   time,
-            const std::vector<PETScWrappers::VectorBase> &all_in,
-            std::vector<PETScWrappers::VectorBase>       &all_out) {
-          this->transfer_solution_vectors_to_new_mesh(time, all_in, all_out);
-        };     
+    return diff;};
+    
+    Vector<double> y(dof_handler.n_dofs()), y_dot(dof_handler.n_dofs());
+    compute_stokes_initial_guess(y,y_dot);
+    
+
+
+
+
+time_stepper.solve_dae(y,y_dot);
+
   
-       petsc_ts.monitor = [&](const double                      time,
-                             const PETScWrappers::VectorBase &y,
-                             const unsigned int                step_number) {
-        std::cout << "Time step " << step_number << " at t=" << time << std::endl;
-        this->output_results(time, step_number, y);
-      };
-    PETScWrappers::VectorBase solution;
-    VectorTools::interpolate(dof_handler, initial_value_function, solution);
+ 
   
-    petsc_ts.solve(solution);
+
+  
   
 }
 
@@ -468,10 +427,10 @@ void NavierStokes<dim>::run()
 
 
 template <int dim>
-void NavierStokes<dim>::prepare_for_coarsening_and_refinement(const PETScWrappers::VectorBase &y)
+void NavierStokes<dim>::prepare_for_coarsening_and_refinement(const Vector<double> &y)
 {
-  Vector<double> y_mono(dof_handler.n_dofs());
-  y_mono = y.block(0);
+  
+  
 
   const FEValuesExtractors::Vector velocities(0);
 
@@ -479,7 +438,7 @@ void NavierStokes<dim>::prepare_for_coarsening_and_refinement(const PETScWrapper
   KellyErrorEstimator<dim>::estimate(dof_handler,
                                      QGauss<dim-1>(fe.degree+1),
                                      {},
-                                     y_mono,
+                                     y,
                                      estimated_error_per_cell,
                                     fe.component_mask(velocities));
   GridRefinement::refine_and_coarsen_fixed_fraction(triangulation, estimated_error_per_cell,
@@ -500,136 +459,29 @@ void NavierStokes<dim>::prepare_for_coarsening_and_refinement(const PETScWrapper
 template <int dim>
 void NavierStokes<dim>::transfer_solution_vectors_to_new_mesh(
   const double time,
-  const std::vector<Vector<double>> &all_in,
-  std::vector<Vector<double>> &all_out)
+  Vector<double> &y,
+Vector<double> &y_dot)
 {
- SolutionTransfer<dim,PETScWrappers::VectorBase> solution_trans(dof_handler);
-std::vector<PETScWrappers::VectorBase> all_in_ghosted(all_in.size());
-std::vector<PETScWrappers::VectorBase *> all_in_ghosted_ptr(all_in.size());
-std::vector<PETScWrappers::VectorBase *> all_out_ptr(all_in.size());
-for (unsigned int i=0;i<all_in.size();i++)
-{
-  all_in_ghosted[i].reinit();
-  all_in_ghosted[i] = all_in[i];
-  all_in_ghosted_otr[i] = &all_in_ghosted[i];
+ const std::vector< Vector<double>> all_in ={&y,&y_dot};
+std::vector<Vector<double>> all_out ={&y,&y_dot};
+ SolutionTransfer<dim,Vector<double>> solution_trans(dof_handler);
+
+ 
+ triangulation.prepare_coarsening_and_refinement();
+
+
+ solution_trans.prepare_for_coarsening_and_refinement(all_in);
+ triangulation.execute_coarsening_and_refinement();
+ 
+ setup_system(time);
+ unsigned int n_dofs= dof_handler.n_dofs();
+ y.reinit(n_dofs);
+ y_dot.reinit(n_dofs);
+ solution_trans.interpolate(all_in,all_out); //versione 9.7 è diverso
+ 
+
+
 }
-
-triangulation.prepare_coarsening_and_refinement();
-solution_trans.prepare_for_coarsening_and_refinement(all_in_ghosted_ptr);
-triangulation.execute_coarsening_and_refinement();
-
-setup_system(time);
-
-all_out.resize(all_in.size());
-for(unsigned int i=0;i<all_in.size(); i++)
-{
-  all_out[i].reinit();
-  all_out_ptr[i] = &all_out[i];
-}
-solution_trans.interpolate(all_out_ptr);
-
-for (PETScWrappers::VectorBase &v : all_out)
-   hanging_node_constraints.distribute(v);
-}
-
-
-template <int dim>
-void NavierStokes<dim>::explicit_function(const double time, const PETScWrappers::VectorBase &y, 
-                             PETScWrappers::VectorBase &rhs)
-{
-    rhs = 0.0;
-
-  PETScWrappers::VectorBase tmp_solution;
-
-  update_current_constraints(time);
-  current_constraints.distribute(tmp_solution);
-  
-
-  const FEValuesExtractors::Vector velocities(0);
-  const FEValuesExtractors::Scalar pressure(dim);
-
-  QGauss<dim> quadrature(fe.degree + 1);
-  FEValues<dim> fe_values(fe, quadrature,
-                          update_values | update_gradients | update_JxW_values|update_quadrature_points);
-
-  const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
-  const unsigned int n_q_points    = quadrature.size();
-
-  Vector<double> cell_residual(dofs_per_cell);
-
-  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-   std::vector<Tensor<1,dim>> u_vals(n_q_points);
-std::vector<Tensor<2,dim>> grad_u(n_q_points);
-std::vector<double> div_u(n_q_points);
-
-rhs=0;
-
-  for (const auto &cell : dof_handler.active_cell_iterators())
-  {
-    fe_values.reinit(cell);
-    cell->get_dof_indices(local_dof_indices);
-
-    std::vector<unsigned int> u_local_pos; u_local_pos.reserve(dofs_per_cell);
-    std::vector<unsigned int> p_local_pos; p_local_pos.reserve(dofs_per_cell);
-    for (unsigned int i = 0; i < dofs_per_cell; ++i)
-    {
-      const unsigned int comp_i = fe.system_to_component_index(i).first;
-      if (comp_i < dim)
-        u_local_pos.push_back(i);   
-      else
-        p_local_pos.push_back(i); 
-    }
-    const unsigned int n_u_cell = u_local_pos.size();
-    const unsigned int n_p_cell = p_local_pos.size();
-
-    Vector<double> local_rhs(dofs_per_cell);
-    local_rhs = 0.0;
-
-  
-    fe_values[velocities].get_function_values   (tmp_solution, u_vals);
-    fe_values[velocities].get_function_gradients(tmp_solution, grad_u);
-    
-
-    
-    for (unsigned int q = 0; q < n_q_points; ++q)
-    {
-      const double JxW = fe_values.JxW(q);
-
-      Tensor<1,dim> conv_q; 
-      for (unsigned int a = 0; a < dim; ++a)
-      {
-        double s = 0.0;
-        for (unsigned int b = 0; b < dim; ++b)
-          s += u_vals[q][b] * grad_u[q][a][b]; 
-        conv_q[a] = s;
-      }
-
-      for (unsigned int iu = 0; iu < u_local_pos.size(); ++iu)
-      {
-        const unsigned int i_loc = u_local_pos[iu];
-        const Tensor<1,dim> phi_i_u = fe_values[velocities].value(i_loc, q);
-
-        local_rhs(i_loc) += -(conv_q * phi_i_u) * JxW; 
-      }
-    }
-
-    current_constraints.distribute_local_to_global(local_rhs, local_dof_indices, rhs);
-  }
-rhs.compress(VectorOperation::add);
-
-for (const auto &c : current_constraints.get_lines())
- {if (c.entries.empty())
-   rhs[c.index]= y[c.index]-tmp_solution[c.index];
-  else
-   rhs[c.index]= y[c.index];}
-rhs.compress(VectorOperation::insert);
-}
-
-
-
-
-
-
 
 
 template <int dim>
@@ -648,22 +500,20 @@ void NavierStokes<dim>::update_current_constraints(const double time)
 }
 
 template <int dim>
-void NavierStokes<dim>::implicit_function(const double time,
-                                         const PETScWrappers::VectorBase &y,
-                                         const PETScWrappers::VectorBase &y_dot,
-                                         PETScWrappers::VectorBase &F )
+void NavierStokes<dim>::residual(const double time,
+                                         const Vector<double> &y,
+                                         const Vector<double> &y_dot,
+                                         Vector<double> &F )
 {
-    PETScWrappers::VectorBase tmp_solution;
-   PETScWrappers::VectorBase tmp_solution_dot;
+    Vector<double> tmp_solution(y);
+   Vector<double> tmp_solution_dot(y_dot);
 
-  tmp_solution = y;
-  tmp_solution_dot = y_dot;
 
   update_current_constraints(time);
   current_constraints.distribute(tmp_solution);
-  homogeneous_constraints.distribute(tmp_solution_dot);
+  current_constraints.distribute(tmp_solution_dot);
 
-  double nu=1.0;
+  double nu=0.1;
   const FEValuesExtractors::Vector velocities(0);
   const FEValuesExtractors::Scalar pressure(dim);
 
@@ -685,8 +535,10 @@ void NavierStokes<dim>::implicit_function(const double time,
   
   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
     std::vector<Tensor<1,dim>> u_vals(n_q_points);
+     std::vector<Tensor<1,dim>> u_vals_dot(n_q_points);
 std::vector<Tensor<2,dim>> grad_u(n_q_points);
 std::vector<double> div_u(n_q_points);
+std::vector<double> pres_val(n_q_points);
 
   F = 0;
 
@@ -695,6 +547,7 @@ std::vector<double> div_u(n_q_points);
   {
     fe_values.reinit(cell);
     cell->get_dof_indices(local_dof_indices);
+    cell_residual = 0.0;
 
     std::vector<unsigned int> u_local_pos; u_local_pos.reserve(dofs_per_cell);
     std::vector<unsigned int> p_local_pos; p_local_pos.reserve(dofs_per_cell);
@@ -718,12 +571,21 @@ std::vector<double> div_u(n_q_points);
 
 
 fe_values[velocities].get_function_values(tmp_solution, u_vals);
-fe_values[velocities].get_function_gradients(tmp_solution_dot, grad_u);
+fe_values[velocities].get_function_values(tmp_solution_dot, u_vals_dot);
+fe_values[velocities].get_function_gradients(tmp_solution, grad_u);
 fe_values[velocities].get_function_divergences(tmp_solution, div_u);
+fe_values[pressure].get_function_values(tmp_solution, pres_val);
      for (unsigned int q = 0; q < n_q_points; ++q)
     {
       const double JxW = fe_values.JxW(q);
-
+      Tensor<1,dim> conv_q;
+      for (unsigned int a = 0; a < dim; ++a)
+      {
+        double s = 0.0;
+        for (unsigned int b = 0; b < dim; ++b)
+          s += u_vals[q][b] * grad_u[q][a][b]; 
+        conv_q[a] = s;
+      }
 
       for (unsigned int iu = 0; iu < n_u_cell; ++iu)
       {
@@ -731,9 +593,10 @@ fe_values[velocities].get_function_divergences(tmp_solution, div_u);
 
         const Tensor<1,dim>  phi_i_u   = fe_values[velocities].value(i_loc, q);
         const Tensor<2,dim>  grad_i_u  = fe_values[velocities].gradient(i_loc, q);
+        const double div_phi_i_u  = fe_values[velocities].divergence(i_loc, q);
 
         
-          cell_residual(i_loc)+= (phi_i_u*u_vals[q]+nu*scalar_product(grad_i_u,grad_u[q]))*JxW;
+          cell_residual(i_loc)+= (phi_i_u*u_vals_dot[q]+nu*scalar_product(grad_i_u,grad_u[q])+conv_q*phi_i_u-div_phi_i_u*pres_val[q])*JxW;
 
          
       }
@@ -744,7 +607,7 @@ fe_values[velocities].get_function_divergences(tmp_solution, div_u);
         const double       phi_i_p = fe_values[pressure].value(ip_loc, q);
 
          
-          cell_residual(ip_loc)+= (-phi_i_p * div_u[q]) * JxW;
+          cell_residual(ip_loc)+= (phi_i_p * div_u[q]) * JxW;
         
       }
     } 
@@ -753,24 +616,28 @@ current_constraints.distribute_local_to_global(cell_residual,
                                                            local_dof_indices,
                                                            F);
 }
-F.compress(VectorOperation::add);
+
 
 for (const auto &c : current_constraints.get_lines())
  {if (c.entries.empty())
    F[c.index]= y[c.index]-tmp_solution[c.index];
   else
-   F[c.index]= y[c.index];}
-F.compress(VectorOperation::insert);
+   F[c.index]= 0.0;}
+
 }
 
 
 template <int dim>
-void NavierStokes<dim>::assemble_implicit_jacobian( const double,
-                                                      const PETScWrappers::VectorBase &,
-                                                     const PETScWrappers::VectorBase &,
+void NavierStokes<dim>::assemble_jacobian( const double t,
+                                                      const Vector<double> &y,
+                                                     const Vector<double> &y_dot,
                                                     const double alpha)
-{
-    double nu=1.0;
+{   jacobian_matrix = 0.0;
+   Vector<double> y_mono = y, ydot_mono = y_dot;
+  update_current_constraints(t);
+  current_constraints.distribute(y_mono);
+  current_constraints.distribute(ydot_mono);
+    double nu=0.1;
   const FEValuesExtractors::Vector velocities(0);
   const FEValuesExtractors::Scalar pressure(dim);
 
@@ -786,9 +653,8 @@ void NavierStokes<dim>::assemble_implicit_jacobian( const double,
 
   const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
-  system_matrix = 0.0;
-  mass_matrix = 0.0;
-  system_rhs = 0.0;
+  
+  
 
   
   
@@ -822,33 +688,21 @@ void NavierStokes<dim>::assemble_implicit_jacobian( const double,
 
    
     Mu = 0.0; Au = 0.0; B = 0.0;
-   jacobian_matrix = 0;
+
   FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
 
 
     std::vector<Tensor<1,dim>> u_vals(n_q_points);
-std::vector<Tensor<2,dim>> grad_u(n_q_points);
+
+    std::vector<Tensor<2,dim>> grad_u(n_q_points);
+    fe_values[velocities].get_function_gradients(y_mono,grad_u);
+    fe_values[velocities].get_function_values(y_mono,u_vals);
 
      for (unsigned int q = 0; q < n_q_points; ++q)
     {
       const double JxW = fe_values.JxW(q);
+      const Tensor<2,dim> &Gu = grad_u[q];
 
-     
-  for (unsigned int a = 0; a < dim; ++a)
-  {
-    double s = 0.0;
-    for (unsigned int b = 0; b < dim; ++b)
-      s += u_vals[q][b] * grad_u[q][a][b]; 
-    conv_q[a] = s;
-  }
-
-  for (unsigned int iu = 0; iu < u_local_pos.size(); ++iu)
-  {
-    const unsigned int i_loc = u_local_pos[iu];
-    const Tensor<1,dim> phi_i_u = fe_values[velocities].value(i_loc, q);
-
-    
-  }
 
       for (unsigned int iu = 0; iu < n_u_cell; ++iu)
       {
@@ -863,10 +717,14 @@ std::vector<Tensor<2,dim>> grad_u(n_q_points);
 
           const Tensor<1,dim>  phi_j_u  = fe_values[velocities].value(j_loc, q);
           const Tensor<2,dim>  grad_j_u = fe_values[velocities].gradient(j_loc, q);
-
+          const Tensor<1,dim> u_q = u_vals[q]; 
+          double conv_missing = 0.0;
+          for (unsigned int a=0; a<dim; ++a)
+            for (unsigned int b=0; b<dim; ++b)
+                conv_missing += phi_i_u[a] * u_q[b] * grad_j_u[a][b];
           Mu(iu, ju) += (phi_i_u * phi_j_u) * JxW;
 
-          Au(iu, ju) += scalar_product(grad_i_u, grad_j_u) * JxW;
+          Au(iu, ju) += (scalar_product(grad_i_u, grad_j_u)*nu+ (Gu*phi_j_u)*phi_i_u+conv_missing) * JxW;
         }
       }
 
@@ -881,7 +739,7 @@ std::vector<Tensor<2,dim>> grad_u(n_q_points);
           const double div_phi_j_u  = fe_values[velocities].divergence(ju_loc, q);
 
          
-          B(ip, ju) += (-phi_i_p * div_phi_j_u) * JxW;
+          B(ip, ju) += (phi_i_p * div_phi_j_u) * JxW;
         }
       }
     } 
@@ -899,7 +757,7 @@ std::vector<Tensor<2,dim>> grad_u(n_q_points);
       {
         const unsigned int j_loc = u_local_pos[ju];
 
-       cell_matrix(i_loc, j_loc) += alpha*Mu(iu, ju)+nu*Au(iu,ju);          
+       cell_matrix(i_loc, j_loc) += alpha*Mu(iu, ju)+Au(iu,ju);          
       }
     }
 
@@ -913,7 +771,7 @@ std::vector<Tensor<2,dim>> grad_u(n_q_points);
 
         const double Bij = B(ip, ju);
         cell_matrix(ip_loc, ju_loc) += Bij;  
-        cell_matrix(ju_loc, ip_loc) += Bij;  
+        cell_matrix(ju_loc, ip_loc) -= Bij;  
       }
     }
 
@@ -921,37 +779,100 @@ std::vector<Tensor<2,dim>> grad_u(n_q_points);
     homogeneous_constraints.distribute_local_to_global(cell_matrix,
                                                        local_dof_indices,
                                                        jacobian_matrix);
+   
+    
                                      
   }
-  jacobian_matrix.compress(VectorOperation::add);
-   for (const auto &c : current_constraints.get_lines())
-        jacobian_matrix.set(c.index, c.index, 1.0);
-      jacobian_matrix.compress(VectorOperation::insert);
+  
+  for (const auto &line : current_constraints.get_lines())
+  if (line.entries.empty())          
+  {
+    const auto i = line.index;
+    
+    for (auto it = jacobian_matrix.begin(i); it != jacobian_matrix.end(i); ++it)
+      jacobian_matrix.set(i, it->column(), 0.0);
+    jacobian_matrix.set(i, i, 1.0);
+  }
+ 
 }
 
 template <int dim>
-void NavierStokes<dim>::solve_with_jacobian( const PETScWrappers::VectorBase &src,
-                                             PETScWrappers::VectorBase &dst)
+void NavierStokes<dim>::solve_with_jacobian( const Vector<double> &src,
+                                             Vector<double> &dst,
+                                            const double tol)
 {
-  #if defined(PETSC_HAVE_HYPRE)
-      PETScWrappers::PreconditionBoomerAMG preconditioner;
-      preconditioner.initialize(jacobian_matrix);
-  #else
-      PETScWrappers::PrecondtionSSOR preconditioner;
-      preconditioner.initialize(jacobian_matrix, PETScWrappers::PrecondtionSSOR::AdditionalData(1.0));
-  #endif
-
-     SolverControl           solver_control(1000, 1e-8 * src.l2_norm());
-      PETScWrappers::SolverCG cg(solver_control);
-      cg.set_prefix("user_");
   
-      cg.solve(jacobian_matrix, dst, src, preconditioner);
+    const double rhs_norm = src.l2_norm();
+    const double lin_tol = std::max(1e-14,tol*std::max(1.0, rhs_norm));
+     SolverControl           solver_control(5000, lin_tol );
+     
+    try {
+     dealii::SparseILU<double> ilu;
+dealii::SparseILU<double>::AdditionalData ilu_data;
+ilu.initialize(jacobian_matrix, ilu_data);
+
+  SolverGMRES<Vector<double>> gm(solver_control);
+  
+  gm.solve(jacobian_matrix, dst, src,ilu);
+  
+} catch (const std::exception &e) {
+  std::cerr << "[GMRES] " << e.what() << std::endl;
+  dst = 0.0;  
+}
   
       std::cout << "     " << solver_control.last_step() << " linear iterations."
             << std::endl;
 }
 
 
+template <int dim>
+void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y, Vector<double> &y_dot)
+{
+  y = 0.0;
+  y_dot = 0.0;
+  homogeneous_constraints.distribute(y);
+
+  Vector<double> F(dof_handler.n_dofs());
+  residual(/*time=*/0.0, y, y_dot, F);
+
+  const double alpha = 0.0;
+  assemble_jacobian(/*time=*/0.0, y, y_dot, alpha);
+
+   for (const auto &line : current_constraints.get_lines())
+    if (line.entries.empty()) {
+      const auto i = line.index;
+      for (auto it = jacobian_matrix.begin(i); it != jacobian_matrix.end(i); ++it)
+        jacobian_matrix.set(i, it->column(), 0.0);
+      jacobian_matrix.set(i, i, 1.0);
+    }
+
+  Vector<double> delta(dof_handler.n_dofs());
+  F *= -1.0;
+  solve_with_jacobian(F, delta,1e-8);
+
+  y += delta;
+  y_dot = 0.0;
+  homogeneous_constraints.distribute(y);
+
+  for (unsigned int k=0; k<2; ++k)
+  {
+    residual(0.0, y, y_dot, F);
+    if (F.l2_norm() < 1e-10) break;
+    F *= -1.0;
+    assemble_jacobian(0.0, y, y_dot, 0.0);
+    for (const auto &line : current_constraints.get_lines())
+      if (line.entries.empty())
+      {
+        const auto i = line.index;
+        for (auto it = jacobian_matrix.begin(i); it != jacobian_matrix.end(i); ++it)
+          jacobian_matrix.set(i, it->column(), 0.0);
+        jacobian_matrix.set(i, i, 1.0);
+        
+      }
+    solve_with_jacobian(F, delta, 1e-8);
+    y += delta;
+  }
+}
 
 
 }
@@ -1165,4 +1086,126 @@ void NavierStokes<dim>::assemble_convective_rhs_from(const Vector<double> &y,
   }
 
   rhs = rhs_mono;
-}*/
+
+
+  template <int dim>
+void NavierStokes<dim>::explicit_function(const double time, const PETScWrappers::VectorBase &y, 
+                             PETScWrappers::VectorBase &rhs)
+{
+    rhs = 0.0;
+
+  PETScWrappers::VectorBase tmp_solution;
+
+  update_current_constraints(time);
+  current_constraints.distribute(tmp_solution);
+  
+
+  const FEValuesExtractors::Vector velocities(0);
+  const FEValuesExtractors::Scalar pressure(dim);
+
+  QGauss<dim> quadrature(fe.degree + 1);
+  FEValues<dim> fe_values(fe, quadrature,
+                          update_values | update_gradients | update_JxW_values|update_quadrature_points);
+
+  const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
+  const unsigned int n_q_points    = quadrature.size();
+
+  Vector<double> cell_residual(dofs_per_cell);
+
+  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+   std::vector<Tensor<1,dim>> u_vals(n_q_points);
+std::vector<Tensor<2,dim>> grad_u(n_q_points);
+std::vector<double> div_u(n_q_points);
+
+rhs=0;
+
+  for (const auto &cell : dof_handler.active_cell_iterators())
+  {
+    fe_values.reinit(cell);
+    cell->get_dof_indices(local_dof_indices);
+
+    std::vector<unsigned int> u_local_pos; u_local_pos.reserve(dofs_per_cell);
+    std::vector<unsigned int> p_local_pos; p_local_pos.reserve(dofs_per_cell);
+    for (unsigned int i = 0; i < dofs_per_cell; ++i)
+    {
+      const unsigned int comp_i = fe.system_to_component_index(i).first;
+      if (comp_i < dim)
+        u_local_pos.push_back(i);   
+      else
+        p_local_pos.push_back(i); 
+    }
+    const unsigned int n_u_cell = u_local_pos.size();
+    const unsigned int n_p_cell = p_local_pos.size();
+
+    Vector<double> local_rhs(dofs_per_cell);
+    local_rhs = 0.0;
+
+  
+    fe_values[velocities].get_function_values   (tmp_solution, u_vals);
+    fe_values[velocities].get_function_gradients(tmp_solution, grad_u);
+    
+
+    
+    for (unsigned int q = 0; q < n_q_points; ++q)
+    {
+      const double JxW = fe_values.JxW(q);
+
+      Tensor<1,dim> conv_q; 
+      for (unsigned int a = 0; a < dim; ++a)
+      {
+        double s = 0.0;
+        for (unsigned int b = 0; b < dim; ++b)
+          s += u_vals[q][b] * grad_u[q][a][b]; 
+        conv_q[a] = s;
+      }
+
+      for (unsigned int iu = 0; iu < u_local_pos.size(); ++iu)
+      {
+        const unsigned int i_loc = u_local_pos[iu];
+        const Tensor<1,dim> phi_i_u = fe_values[velocities].value(i_loc, q);
+
+        local_rhs(i_loc) += -(conv_q * phi_i_u) * JxW; 
+      }
+    }
+
+    current_constraints.distribute_local_to_global(local_rhs, local_dof_indices, rhs);
+  }
+rhs.compress(VectorOperation::add);
+
+for (const auto &c : current_constraints.get_lines())
+ {if (c.entries.empty())
+   rhs[c.index]= y[c.index]-tmp_solution[c.index];
+  else
+   rhs[c.index]= y[c.index];}
+rhs.compress(VectorOperation::insert);
+}
+}
+
+
+
+std::vector<PETScWrappers::VectorBase> all_in_ghosted(all_in.size());
+std::vector<PETScWrappers::VectorBase *> all_in_ghosted_ptr(all_in.size());
+std::vector<PETScWrappers::VectorBase *> all_out_ptr(all_in.size());
+for (unsigned int i=0;i<all_in.size();i++)
+{
+  all_in_ghosted[i].reinit();
+  all_in_ghosted[i] = all_in[i];
+  all_in_ghosted_otr[i] = &all_in_ghosted[i];
+}
+
+triangulation.prepare_coarsening_and_refinement();
+solution_trans.prepare_for_coarsening_and_refinement(all_in_ghosted_ptr);
+triangulation.execute_coarsening_and_refinement();
+
+setup_system(time);
+
+all_out.resize(all_in.size());
+for(unsigned int i=0;i<all_in.size(); i++)
+{
+  all_out[i].reinit();
+  all_out_ptr[i] = &all_out[i];
+}
+solution_trans.interpolate(all_out_ptr);
+
+for (PETScWrappers::VectorBase &v : all_out)
+   hanging_node_constraints.distribute(v);*/
