@@ -106,7 +106,7 @@ namespace IMEX_NS
       
       void update_current_constraints(const double time);
 
-      void compute_stokes_initial_guess(Vector<double> &y, Vector<double> &y_dot);
+      void compute_stokes_initial_guess(Vector<double> &y);
 
       AffineConstraints<double> hanging_node_constraints;
       AffineConstraints<double> current_constraints;
@@ -405,7 +405,8 @@ time_stepper.residual = [&](const double time,
     return diff;};
     
     Vector<double> y(dof_handler.n_dofs()), y_dot(dof_handler.n_dofs());
-    compute_stokes_initial_guess(y,y_dot);
+    compute_stokes_initial_guess(y);
+    std::cout<< y.linfty_norm()<<std::endl; 
     
 
 
@@ -826,53 +827,106 @@ ilu.initialize(jacobian_matrix, ilu_data);
 
 
 template <int dim>
-void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y, Vector<double> &y_dot)
+void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y)
 {
-  y = 0.0;
-  y_dot = 0.0;
-  homogeneous_constraints.distribute(y);
+  AffineConstraints<double> guess_constraints;
+  SparsityPattern sp_guess;
+  SparseMatrix<double> laplace_guess;
+  Vector<double> y_tmp, rhs_guess;
 
-  Vector<double> F(dof_handler.n_dofs());
-  residual(/*time=*/0.0, y, y_dot, F);
+  const FEValuesExtractors::Vector velocities(0);
+  const FEValuesExtractors::Scalar pressure(dim);
 
-  const double alpha = 0.0;
-  assemble_jacobian(/*time=*/0.0, y, y_dot, alpha);
+  InletVelocity<dim> inlet;
+  guess_constraints.clear();
+  guess_constraints.merge(hanging_node_constraints);
+  VectorTools::interpolate_boundary_values(dof_handler, 1,
+      Functions::ZeroFunction<dim>(dim+1),
+      guess_constraints, fe.component_mask(velocities));
+  VectorTools::interpolate_boundary_values(dof_handler, 4,
+      Functions::ZeroFunction<dim>(dim+1),
+      guess_constraints, fe.component_mask(velocities));
+  
+  VectorTools::interpolate_boundary_values(dof_handler, 2,
+      inlet, guess_constraints, fe.component_mask(velocities));
 
-   for (const auto &line : current_constraints.get_lines())
-    if (line.entries.empty()) {
-      const auto i = line.index;
-      for (auto it = jacobian_matrix.begin(i); it != jacobian_matrix.end(i); ++it)
-        jacobian_matrix.set(i, it->column(), 0.0);
-      jacobian_matrix.set(i, i, 1.0);
-    }
+  
+  guess_constraints.close();
 
-  Vector<double> delta(dof_handler.n_dofs());
-  F *= -1.0;
-  solve_with_jacobian(F, delta,1e-8);
+ 
+  DynamicSparsityPattern dsp_guess(dof_handler.n_dofs());
+  DoFTools::make_sparsity_pattern(dof_handler, dsp_guess, guess_constraints);
+  sp_guess.copy_from(dsp_guess);
+  laplace_guess.reinit(sp_guess);
 
-  y += delta;
-  y_dot = 0.0;
-  homogeneous_constraints.distribute(y);
 
-  for (unsigned int k=0; k<2; ++k)
+  y_tmp.reinit(dof_handler.n_dofs()); y_tmp = 0.0;
+  rhs_guess.reinit(dof_handler.n_dofs()); rhs_guess = 0.0;
+
+  QGauss<dim> quadrature(fe.degree + 1);
+  FEValues<dim> fe_values(fe, quadrature,
+                          update_gradients | update_JxW_values);
+
+  const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
+  std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+  FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
+
+  for (const auto &cell : dof_handler.active_cell_iterators())
   {
-    residual(0.0, y, y_dot, F);
-    if (F.l2_norm() < 1e-10) break;
-    F *= -1.0;
-    assemble_jacobian(0.0, y, y_dot, 0.0);
-    for (const auto &line : current_constraints.get_lines())
-      if (line.entries.empty())
+    fe_values.reinit(cell);
+    cell->get_dof_indices(local_dof_indices);
+
+    std::vector<unsigned int> u_local_pos; u_local_pos.reserve(dofs_per_cell);
+    for (unsigned int i = 0; i < dofs_per_cell; ++i)
+      if (fe.system_to_component_index(i).first < dim) u_local_pos.push_back(i);
+
+    cell_matrix = 0.0;
+
+    for (const unsigned int q : fe_values.quadrature_point_indices())
+      for (unsigned int iu = 0; iu < u_local_pos.size(); ++iu)
       {
-        const auto i = line.index;
-        for (auto it = jacobian_matrix.begin(i); it != jacobian_matrix.end(i); ++it)
-          jacobian_matrix.set(i, it->column(), 0.0);
-        jacobian_matrix.set(i, i, 1.0);
-        
+        const unsigned int i_loc = u_local_pos[iu];
+        const Tensor<2,dim> grad_i = fe_values[velocities].gradient(i_loc, q);
+        for (unsigned int ju = 0; ju < u_local_pos.size(); ++ju) // <-- ++ju
+        {
+          const unsigned int j_loc = u_local_pos[ju];
+          const Tensor<2,dim> grad_j = fe_values[velocities].gradient(j_loc, q);
+          cell_matrix(i_loc, j_loc) += scalar_product(grad_i, grad_j) * fe_values.JxW(q);
+        }
       }
-    solve_with_jacobian(F, delta, 1e-8);
-    y += delta;
+
+    guess_constraints.distribute_local_to_global(cell_matrix, local_dof_indices, laplace_guess);
   }
+
+  
+  SolverControl solve_control(1000, 1e-12);
+  SolverCG<Vector<double>> solver(solve_control);
+  solver.solve(laplace_guess, y_tmp, rhs_guess, PreconditionIdentity());
+  guess_constraints.distribute(y_tmp);
+
+  y = y_tmp; 
+
+
+  std::vector<std::string> names;
+  for (unsigned int d = 0; d < dim; ++d)
+    names.push_back(std::string("u_") + (d==0?"x":(d==1?"y":"z")));
+  names.push_back("p");
+
+  // interpreta i primi 'dim' come un vettore e l'ultimo come scalare
+  std::vector<DataComponentInterpretation::DataComponentInterpretation>
+      interpretation(dim, DataComponentInterpretation::component_is_part_of_vector);
+  interpretation.push_back(DataComponentInterpretation::component_is_scalar);
+
+  DataOut<dim> data_out;
+  data_out.attach_dof_handler(dof_handler);
+  data_out.add_data_vector(y, names, DataOut<dim>::type_dof_data, interpretation);
+  data_out.build_patches(fe.degree); // o un numero fisso (ad es. 2) se preferisci
+
+  std::ofstream out("stokes_guess.vtu");
+  data_out.write_vtu(out);
 }
+
 
 
 }
