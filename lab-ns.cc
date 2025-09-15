@@ -271,6 +271,7 @@ DoFRenumbering::component_wise(dof_handler, block_comp);
 
       FEValuesExtractors::Vector velocities(0);
       FEValuesExtractors::Scalar pressure(dim);
+      const FEValuesExtractors::Scalar v_y(1); 
     
       auto  boundary_ids =  triangulation.get_boundary_ids();
       homogeneous_constraints.clear();
@@ -281,20 +282,23 @@ DoFRenumbering::component_wise(dof_handler, block_comp);
       uy_mask[1]= true;
 
       Functions::ParsedFunction<dim> vel_exact;
+      
 
   VectorTools::interpolate_boundary_values(dof_handler, 1,
       Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints, vel_mask);
   VectorTools::interpolate_boundary_values(dof_handler, 4,
       Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints, vel_mask);
+  VectorTools::interpolate_boundary_values(dof_handler,3, Functions::ZeroFunction<dim>(dim+1), homogeneous_constraints,fe.component_mask(v_y));
+  VectorTools::interpolate_boundary_values(
+  dof_handler,
+  3,
+  Functions::ZeroFunction<dim>(dim+1),
+  homogeneous_constraints,
+  fe.component_mask(pressure));
 
   
 
   
-IndexSet p_dofs(dof_handler.n_dofs());
-p_dofs.add_indices(DoFTools::extract_dofs(dof_handler, fe.component_mask(pressure)));
-types::global_dof_index p0 = *p_dofs.begin();  
-homogeneous_constraints.add_line(p0);
-homogeneous_constraints.set_inhomogeneity(p0, 0.0);
 homogeneous_constraints.close();
 
 
@@ -625,6 +629,7 @@ for (const auto &c : current_constraints.get_lines())
   else
    F[c.index]= 0.0;}
 
+   std::cout<< F.linfty_norm()<<std::endl;
 }
 
 
@@ -836,6 +841,7 @@ void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y)
 
   const FEValuesExtractors::Vector velocities(0);
   const FEValuesExtractors::Scalar pressure(dim);
+      const FEValuesExtractors::Scalar v_y(1); 
 
   InletVelocity<dim> inlet;
   guess_constraints.clear();
@@ -849,6 +855,14 @@ void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y)
   
   VectorTools::interpolate_boundary_values(dof_handler, 2,
       inlet, guess_constraints, fe.component_mask(velocities));
+  
+   VectorTools::interpolate_boundary_values(dof_handler,3, Functions::ZeroFunction<dim>(dim+1), guess_constraints,fe.component_mask(v_y));
+  VectorTools::interpolate_boundary_values(
+  dof_handler,
+  3,
+  Functions::ZeroFunction<dim>(dim+1),
+  guess_constraints,
+  fe.component_mask(pressure));
 
   
   guess_constraints.close();
