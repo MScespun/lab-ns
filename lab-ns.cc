@@ -162,6 +162,10 @@ namespace IMEX_NS
       SUNDIALS::IDA<Vector<double>>::AdditionalData data_ida;
       double current_time_for_logs = std::numeric_limits<double>::quiet_NaN();
 
+      AffineConstraints<double> derivative_constraints;
+
+      void update_derivative_constraints();
+
      
 
      };
@@ -191,17 +195,42 @@ namespace IMEX_NS
       , data_ida()
       {
        data_ida.initial_time = 0.0;
-       data_ida.final_time = 5.0;
+       data_ida.final_time = 25.0;
        data_ida.initial_step_size = 0.01;
-       data_ida.minimum_step_size = 0.001;
+       data_ida.minimum_step_size = 0.0001;
        data_ida.absolute_tolerance = 1e-6;
        data_ida.relative_tolerance = 1e-6;
-       data_ida.output_period = 0.01;
+       data_ida.output_period = 0.1;
        data_ida.ic_type = SUNDIALS::IDA<Vector<double>>::AdditionalData::use_y_diff;
        data_ida.reset_type  = SUNDIALS::IDA<Vector<double>>::AdditionalData::use_y_diff;
-       data_ida.maximum_non_linear_iterations_ic = 10;
+       data_ida.maximum_non_linear_iterations_ic = 100;
       }     
+  
+template <int dim>
+void NavierStokes<dim>::update_derivative_constraints()
+{
+  derivative_constraints.clear();
+  derivative_constraints.merge(hanging_node_constraints);
+
+  const FEValuesExtractors::Vector velocities(0);
+
+  // velocità: derivata nulla dove imponi Dirichlet costante nel tempo
+  VectorTools::interpolate_boundary_values(dof_handler, 1,
+      Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(velocities));
+  VectorTools::interpolate_boundary_values(dof_handler, 2, // inlet!
+      Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(velocities));
+  VectorTools::interpolate_boundary_values(dof_handler, 4,
+      Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(velocities));
+
+  // se su id 3 imponi uy=0 costante, metti derivata nulla anche lì per la componente y
+  VectorTools::interpolate_boundary_values(dof_handler, 3,
+      Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(FEValuesExtractors::Scalar(1)));
+
+  derivative_constraints.close();
+}
       
+
+
       
     template <int dim>
 void NavierStokes<dim>::output_results(const double time,
@@ -377,7 +406,7 @@ time_stepper.residual = [&](const double time,
                                   const unsigned int step_number)
                                   {Vector<double> vis = y;
   update_current_constraints(t);
-  current_constraints.distribute(vis);    
+  homogeneous_constraints.distribute(vis);    
   std::cout << " step: "<< step_number <<"t= " << t << "  ||y||_inf=" << y.linfty_norm() << std::endl;
   this->output_results(t, step_number, vis); };
 
@@ -386,16 +415,22 @@ time_stepper.residual = [&](const double time,
                                              Vector<double> &y,
                                              Vector<double> &y_dot)
    { std::cout<< "solver_should_restart"<<std::endl;
-     if(time>= 0.03*threshold_refine)
-     {threshold_refine ++;
-      std::cout<< "primo"<< y.l2_norm()<<std::endl;
+     if(time>= 0.3*threshold_refine)
+     {threshold_refine ++;       
+     Vector<double> tmp_y = y;
+     Vector<double> tmp_y_dot = y_dot;
+     update_current_constraints(time);
+     update_derivative_constraints();
+   
      
           std::cout << std::endl << "Adapting the mesh..." << std::endl;
             this->prepare_for_coarsening_and_refinement(y);
-            this->transfer_solution_vectors_to_new_mesh(time, y, y_dot);
-            std::cout<<"secondo"<< y.l2_norm();
-            
-            
+            this->transfer_solution_vectors_to_new_mesh(time, tmp_y, tmp_y_dot);
+            y= tmp_y;
+            y_dot.reinit(y);
+            y_dot=0.0;
+
+            data_ida.initial_step_size = 1e-6;
             return true;
 
 
@@ -472,11 +507,8 @@ void NavierStokes<dim>::transfer_solution_vectors_to_new_mesh(
   const double time,
   Vector<double> &y,
 Vector<double> &y_dot)
-{auto y_cons = y;
-  auto y_cons_dot  = y_dot;
-  update_current_constraints(time);
-  current_constraints.distribute(y_cons);
- const std::vector< Vector<double>> all_in={y_cons,y_cons_dot};
+{const std::vector<Vector<double>> all_in={y};
+  
  
   
  SolutionTransfer<dim,Vector<double>> solution_trans(dof_handler);
@@ -491,20 +523,39 @@ Vector<double> &y_dot)
  
  setup_system(time);
  unsigned int n_dofs= dof_handler.n_dofs();
- std::vector<Vector<double>> all_out(2);
-  all_out[0].reinit(n_dofs);
-  all_out[1].reinit(n_dofs);
+ std::vector<Vector<double>> all_out(1);
+ all_out[0].reinit(n_dofs);
+
 
  y.reinit(n_dofs);
  y_dot.reinit(n_dofs);
  
  solution_trans.interpolate(all_in,all_out); //versione 9.7 è diverso
-  y     = all_out[0];
-  y_dot = all_out[1];
 
+  Vector<double> y_tmp    = all_out[0];
+  
+ 
+ AffineConstraints<double> guess_constraints;
+  guess_constraints.clear();
+  
+  guess_constraints.merge(homogeneous_constraints); 
+  
+  const FEValuesExtractors::Vector velocities(0);
+  InletVelocity<dim> inlet;
+  VectorTools::interpolate_boundary_values(dof_handler,
+                                           2,
+                                           inlet,
+                                           guess_constraints,
+                                           fe.component_mask(velocities));
+  guess_constraints.close();
+
+  guess_constraints.distribute(y_tmp);
+
+  y= y_tmp;
   update_current_constraints(time);
-current_constraints.distribute(y);
-homogeneous_constraints.distribute(y_dot);
+  current_constraints.distribute(y);
+  y_dot = 0.0;
+
 
 
 
@@ -538,10 +589,11 @@ void NavierStokes<dim>::residual(const double time,
 
 
   update_current_constraints(time);
+  update_derivative_constraints();
   current_constraints.distribute(tmp_solution);
-  homogeneous_constraints.distribute(tmp_solution_dot);
+  derivative_constraints.distribute(tmp_solution_dot);
 
-  double nu=0.1;
+  double nu=0.01;
   const FEValuesExtractors::Vector velocities(0);
   const FEValuesExtractors::Scalar pressure(dim);
 
@@ -658,8 +710,9 @@ void NavierStokes<dim>::assemble_jacobian( const double t,
    Vector<double> y_mono = y, ydot_mono = y_dot;
   update_current_constraints(t);
   current_constraints.distribute(y_mono);
-  homogeneous_constraints.distribute(ydot_mono);
-    double nu=0.1;
+  update_derivative_constraints();
+  derivative_constraints.distribute(ydot_mono);
+    double nu=0.01;
   const FEValuesExtractors::Vector velocities(0);
   const FEValuesExtractors::Scalar pressure(dim);
 
@@ -817,6 +870,7 @@ void NavierStokes<dim>::solve_with_jacobian( const Vector<double> &src,
 {
   
     const double rhs_norm = src.l2_norm();
+    
     const double lin_tol = std::max(1e-14,tol*std::max(1.0, rhs_norm));
      SolverControl           solver_control(5000, lin_tol );
      
@@ -825,17 +879,21 @@ void NavierStokes<dim>::solve_with_jacobian( const Vector<double> &src,
 dealii::SparseILU<double>::AdditionalData ilu_data;
 ilu.clear();
 ilu.initialize(jacobian_matrix, ilu_data);
-
-  SolverGMRES<Vector<double>> gm(solver_control);
+SparseDirectUMFPACK direct;
+  direct.initialize(jacobian_matrix);
+  direct.vmult(dst, src);        
   
-  gm.solve(jacobian_matrix, dst, src,ilu);
+
+//  SolverGMRES<Vector<double>> gm(solver_control);
+  
+  //gm.solve(jacobian_matrix, dst, src,ilu);
   
 } catch (const std::exception &e) {
   std::cerr << "[GMRES] " << e.what() << std::endl;
   dst = 0.0;  
 }
   
-      std::cout << "     " << solver_control.last_step() << " linear iterations."
+      std::cout << "iter"
             << std::endl;
 }
 
