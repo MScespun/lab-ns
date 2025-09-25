@@ -165,6 +165,7 @@ namespace IMEX_NS
       AffineConstraints<double> derivative_constraints;
 
       void update_derivative_constraints();
+      void project_div_free(Vector<double> &y);
 
      
 
@@ -391,7 +392,7 @@ time_stepper.residual = [&](const double time,
                                const Vector<double> &y_dot,
                                const double alpha){
                                 this-> assemble_jacobian(time, y, y_dot, alpha);
-                                 std::cout<< "setup_jacobian"<<std::endl;
+                                 //std::cout<< "setup_jacobian"<<std::endl;
                                };
   
   time_stepper.solve_with_jacobian = [&](const  Vector<double> &src,
@@ -414,23 +415,22 @@ time_stepper.residual = [&](const double time,
     time_stepper.solver_should_restart = [&](const double time,
                                              Vector<double> &y,
                                              Vector<double> &y_dot)
-   { std::cout<< "solver_should_restart"<<std::endl;
-     if(time>= 0.3*threshold_refine)
-     {threshold_refine ++;       
+   { std::cout<< "solver_should_restart"<< time << std::endl;  
+     if(time>= 1.0*threshold_refine)
+     {threshold_refine ++; 
+          
      Vector<double> tmp_y = y;
      Vector<double> tmp_y_dot = y_dot;
-     update_current_constraints(time);
-     update_derivative_constraints();
+     
    
      
           std::cout << std::endl << "Adapting the mesh..." << std::endl;
             this->prepare_for_coarsening_and_refinement(y);
             this->transfer_solution_vectors_to_new_mesh(time, tmp_y, tmp_y_dot);
             y= tmp_y;
-            y_dot.reinit(y);
+            y_dot = tmp_y_dot;
             y_dot=0.0;
 
-            data_ida.initial_step_size = 1e-6;
             return true;
 
 
@@ -507,54 +507,37 @@ void NavierStokes<dim>::transfer_solution_vectors_to_new_mesh(
   const double time,
   Vector<double> &y,
 Vector<double> &y_dot)
-{const std::vector<Vector<double>> all_in={y};
-  
- 
-  
- SolutionTransfer<dim,Vector<double>> solution_trans(dof_handler);
+{ // 1) Vincoli del VECCHIO mesh
+  update_current_constraints(time);            // usa il dof_handler corrente (vecchio)
+  Vector<double> y_in = y;
+  current_constraints.distribute(y_in);        // <-- rende y coerente con hanging nodes & BC
 
- 
- triangulation.prepare_coarsening_and_refinement();
+  const std::vector<Vector<double>> all_in = {y_in};
+  SolutionTransfer<dim, Vector<double>> soltrans(dof_handler);
 
+  triangulation.prepare_coarsening_and_refinement();
+  soltrans.prepare_for_coarsening_and_refinement(all_in);
 
- solution_trans.prepare_for_coarsening_and_refinement(all_in);
- triangulation.execute_coarsening_and_refinement();
- 
- 
- setup_system(time);
- unsigned int n_dofs= dof_handler.n_dofs();
- std::vector<Vector<double>> all_out(1);
- all_out[0].reinit(n_dofs);
+  triangulation.execute_coarsening_and_refinement();
 
+  // 2) Reimposta DoF sul NUOVO mesh
+  setup_system(time);                          // ricrea dof_handler/constraints per il nuovo mesh
 
- y.reinit(n_dofs);
- y_dot.reinit(n_dofs);
- 
- solution_trans.interpolate(all_in,all_out); //versione 9.7 è diverso
+  std::vector<Vector<double>> all_out(1);
+  all_out[0].reinit(dof_handler.n_dofs());
 
-  Vector<double> y_tmp    = all_out[0];
-  
- 
- AffineConstraints<double> guess_constraints;
-  guess_constraints.clear();
-  
-  guess_constraints.merge(homogeneous_constraints); 
-  
-  const FEValuesExtractors::Vector velocities(0);
-  InletVelocity<dim> inlet;
-  VectorTools::interpolate_boundary_values(dof_handler,
-                                           2,
-                                           inlet,
-                                           guess_constraints,
-                                           fe.component_mask(velocities));
-  guess_constraints.close();
+  soltrans.interpolate(all_in, all_out);
 
-  guess_constraints.distribute(y_tmp);
+  // 3) Applica vincoli del NUOVO mesh
+  y.reinit(dof_handler.n_dofs());
+  y      = all_out[0];
+  update_current_constraints(time);            // ora riferito al nuovo dof_handler
+  current_constraints.distribute(y);          // opzionale ma consigliato
 
-  y= y_tmp;
-  update_current_constraints(time);
-  current_constraints.distribute(y);
+  // se non trasferisci y_dot, azzera come già fai
+  y_dot.reinit(dof_handler.n_dofs());
   y_dot = 0.0;
+   project_div_free(y);
 
 
 
@@ -592,6 +575,10 @@ void NavierStokes<dim>::residual(const double time,
   update_derivative_constraints();
   current_constraints.distribute(tmp_solution);
   derivative_constraints.distribute(tmp_solution_dot);
+
+  
+  
+  
 
   double nu=0.01;
   const FEValuesExtractors::Vector velocities(0);
@@ -654,6 +641,7 @@ fe_values[velocities].get_function_values(tmp_solution, u_vals);
 fe_values[velocities].get_function_values(tmp_solution_dot, u_vals_dot);
 fe_values[velocities].get_function_gradients(tmp_solution, grad_u);
 fe_values[velocities].get_function_divergences(tmp_solution, div_u);
+
 fe_values[pressure].get_function_values(tmp_solution, pres_val);
      for (unsigned int q = 0; q < n_q_points; ++q)
     {
@@ -710,8 +698,7 @@ void NavierStokes<dim>::assemble_jacobian( const double t,
    Vector<double> y_mono = y, ydot_mono = y_dot;
   update_current_constraints(t);
   current_constraints.distribute(y_mono);
-  update_derivative_constraints();
-  derivative_constraints.distribute(ydot_mono);
+  
     double nu=0.01;
   const FEValuesExtractors::Vector velocities(0);
   const FEValuesExtractors::Scalar pressure(dim);
@@ -812,6 +799,7 @@ void NavierStokes<dim>::assemble_jacobian( const double t,
         {
           const unsigned int ju_loc = u_local_pos[ju];
           const double div_phi_j_u  = fe_values[velocities].divergence(ju_loc, q);
+          
 
          
           B(ip, ju) += (phi_i_p * div_phi_j_u) * JxW;
@@ -875,10 +863,6 @@ void NavierStokes<dim>::solve_with_jacobian( const Vector<double> &src,
      SolverControl           solver_control(5000, lin_tol );
      
     try {
-     dealii::SparseILU<double> ilu;
-dealii::SparseILU<double>::AdditionalData ilu_data;
-ilu.clear();
-ilu.initialize(jacobian_matrix, ilu_data);
 SparseDirectUMFPACK direct;
   direct.initialize(jacobian_matrix);
   direct.vmult(dst, src);        
@@ -892,9 +876,6 @@ SparseDirectUMFPACK direct;
   std::cerr << "[GMRES] " << e.what() << std::endl;
   dst = 0.0;  
 }
-  
-      std::cout << "iter"
-            << std::endl;
 }
 
 
@@ -934,7 +915,7 @@ void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y)
   y_tmp = 0.0;
 
  
-  const double nu = 0.1;
+  const double nu = 0.01;
 
   const FEValuesExtractors::Scalar pressure(dim);
   QGauss<dim> quad(fe.degree + 1);
@@ -1030,6 +1011,135 @@ void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y)
 
   y = y_tmp;
  
+}
+template <int dim>
+void NavierStokes<dim>::project_div_free(Vector<double> &y)
+{
+  // y = [u;p]. Salva u_interpolata:
+  Vector<double> y_rhs = y;
+  AffineConstraints<double> guess_constraints;
+   guess_constraints.clear();
+
+  guess_constraints.merge(homogeneous_constraints); 
+
+const FEValuesExtractors::Vector velocities(0);
+  InletVelocity<dim> inlet;
+  VectorTools::interpolate_boundary_values(dof_handler,
+                                           2,
+                                           inlet,
+                                           guess_constraints,
+                                           fe.component_mask(velocities));
+  guess_constraints.close();
+
+  const double nu = 0.01;
+  // Sparsità & matrice sella:
+  SparsityPattern sp;
+  {
+    DynamicSparsityPattern dsp(dof_handler.n_dofs());
+    DoFTools::make_sparsity_pattern(dof_handler, dsp, current_constraints, /*keep_constrained=*/true);
+    sp.copy_from(dsp);
+  }
+  SparseMatrix<double> K;   // [ M  B^T; B  0 ]
+  K.reinit(sp);
+  Vector<double> rhs(dof_handler.n_dofs());
+  rhs = 0.0;
+
+
+  const FEValuesExtractors::Scalar pressure(dim);
+  QGauss<dim> quad(fe.degree+1);
+  FEValues<dim> fe_values(fe, quad, update_values|update_gradients|update_JxW_values|update_quadrature_points);
+
+  const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
+  std::vector<types::global_dof_index> dof_indices(dofs_per_cell);
+
+  for (const auto &cell : dof_handler.active_cell_iterators())
+  {
+    fe_values.reinit(cell);
+    cell->get_dof_indices(dof_indices);
+
+    std::vector<unsigned int> u_pos, p_pos;
+    u_pos.reserve(dofs_per_cell); p_pos.reserve(dofs_per_cell);
+    for (unsigned int i=0;i<dofs_per_cell;++i)
+      (fe.system_to_component_index(i).first < dim ? u_pos : p_pos).push_back(i);
+
+    const unsigned int n_u = u_pos.size(), n_p = p_pos.size();
+    FullMatrix<double> Muu(n_u,n_u);     Muu = 0.0;
+    FullMatrix<double> Bpu(n_p,n_u);     Bpu = 0.0;
+    Vector<double>     fu(dofs_per_cell); fu  = 0.0;
+
+    std::vector<Tensor<1,dim>> u_interp_vals(quad.size());
+    fe_values[velocities].get_function_values(y_rhs, u_interp_vals);
+
+    for (unsigned int q=0;q<quad.size();++q)
+    {
+      const double JxW = fe_values.JxW(q);
+
+      // Muu
+      for (unsigned int iu=0; iu<n_u; ++iu)
+      {
+        const auto i_loc = u_pos[iu];
+        const Tensor<2,dim> grad_i_u = fe_values[velocities].gradient(i_loc,q);
+        const Tensor<1,dim> phi_i = fe_values[velocities].value(i_loc,q);
+
+        for (unsigned int ju=0; ju<n_u; ++ju)
+        {
+          const auto j_loc = u_pos[ju];
+          const Tensor<2,dim> grad_j_u = fe_values[velocities].gradient(j_loc,q);
+          const Tensor<1,dim> phi_j = fe_values[velocities].value(j_loc,q);
+          Muu(iu,ju) += (phi_i * phi_j) * JxW  +  nu * scalar_product(grad_i_u, grad_j_u) * JxW;;
+        }
+
+        // f_u (solo sulle posizioni u): (M * u_interp)_i
+        fu(i_loc) += (phi_i * u_interp_vals[q]) * JxW;
+      }
+
+      // B
+      for (unsigned int ip=0; ip<n_p; ++ip)
+      {
+        const auto p_loc = p_pos[ip];
+        const double qi = fe_values[pressure].value(p_loc,q);
+
+        for (unsigned int ju=0; ju<n_u; ++ju)
+        {
+          const auto j_loc = u_pos[ju];
+          const double div_phi_j = fe_values[velocities].divergence(j_loc,q);
+          Bpu(ip,ju) += qi * div_phi_j * JxW;
+        }
+      }
+    }
+
+    // Assembla [M B^T; B 0] e rhs = [f_u; 0]
+    FullMatrix<double> cell_mat(dofs_per_cell, dofs_per_cell);
+    cell_mat = 0.0;
+
+    for (unsigned int iu=0; iu<n_u; ++iu)
+      for (unsigned int ju=0; ju<n_u; ++ju)
+        cell_mat(u_pos[iu], u_pos[ju]) += Muu(iu,ju);
+
+    for (unsigned int ip=0; ip<n_p; ++ip)
+      for (unsigned int ju=0; ju<n_u; ++ju)
+      {
+        const double Bij = Bpu(ip,ju);
+        cell_mat(p_pos[ip], u_pos[ju]) +=  Bij; // B
+        cell_mat(u_pos[ju], p_pos[ip]) +=  -Bij; // B^T
+      }
+
+    Vector<double> cell_rhs(dofs_per_cell);
+    cell_rhs = 0.0;
+    for (unsigned int i=0; i<dofs_per_cell; ++i)
+      cell_rhs(i) += fu(i);
+
+    guess_constraints.distribute_local_to_global(cell_mat, cell_rhs, dof_indices, K, rhs);
+  }
+
+  // Risolvi K * y_corr = rhs
+  SparseDirectUMFPACK direct;
+  direct.initialize(K);
+  Vector<double> y_corr(dof_handler.n_dofs());
+  direct.vmult(y_corr, rhs);
+
+  current_constraints.distribute(y_corr);
+  y = y_corr; // u aggiornato (e p corretto) sovrascrive y
 }
 
 
