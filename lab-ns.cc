@@ -215,7 +215,7 @@ void NavierStokes<dim>::update_derivative_constraints()
 
   const FEValuesExtractors::Vector velocities(0);
 
-  // velocità: derivata nulla dove imponi Dirichlet costante nel tempo
+ 
   VectorTools::interpolate_boundary_values(dof_handler, 1,
       Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(velocities));
   VectorTools::interpolate_boundary_values(dof_handler, 2, // inlet!
@@ -223,7 +223,7 @@ void NavierStokes<dim>::update_derivative_constraints()
   VectorTools::interpolate_boundary_values(dof_handler, 4,
       Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(velocities));
 
-  // se su id 3 imponi uy=0 costante, metti derivata nulla anche lì per la componente y
+ 
   VectorTools::interpolate_boundary_values(dof_handler, 3,
       Functions::ZeroFunction<dim>(dim+1), derivative_constraints, fe.component_mask(FEValuesExtractors::Scalar(1)));
 
@@ -507,10 +507,10 @@ void NavierStokes<dim>::transfer_solution_vectors_to_new_mesh(
   const double time,
   Vector<double> &y,
 Vector<double> &y_dot)
-{ // 1) Vincoli del VECCHIO mesh
-  update_current_constraints(time);            // usa il dof_handler corrente (vecchio)
+{
+  update_current_constraints(time);           
   Vector<double> y_in = y;
-  current_constraints.distribute(y_in);        // <-- rende y coerente con hanging nodes & BC
+  current_constraints.distribute(y_in);       
 
   const std::vector<Vector<double>> all_in = {y_in};
   SolutionTransfer<dim, Vector<double>> soltrans(dof_handler);
@@ -520,21 +520,21 @@ Vector<double> &y_dot)
 
   triangulation.execute_coarsening_and_refinement();
 
-  // 2) Reimposta DoF sul NUOVO mesh
-  setup_system(time);                          // ricrea dof_handler/constraints per il nuovo mesh
+  
+  setup_system(time);                          
 
   std::vector<Vector<double>> all_out(1);
   all_out[0].reinit(dof_handler.n_dofs());
 
   soltrans.interpolate(all_in, all_out);
 
-  // 3) Applica vincoli del NUOVO mesh
+  
   y.reinit(dof_handler.n_dofs());
   y      = all_out[0];
-  update_current_constraints(time);            // ora riferito al nuovo dof_handler
-  current_constraints.distribute(y);          // opzionale ma consigliato
+  update_current_constraints(time);           
+  current_constraints.distribute(y);         
 
-  // se non trasferisci y_dot, azzera come già fai
+  
   y_dot.reinit(dof_handler.n_dofs());
   y_dot = 0.0;
    project_div_free(y);
@@ -1015,7 +1015,7 @@ void NavierStokes<dim>::compute_stokes_initial_guess(Vector<double> &y)
 template <int dim>
 void NavierStokes<dim>::project_div_free(Vector<double> &y)
 {
-  // y = [u;p]. Salva u_interpolata:
+ 
   Vector<double> y_rhs = y;
   AffineConstraints<double> guess_constraints;
    guess_constraints.clear();
@@ -1032,14 +1032,14 @@ const FEValuesExtractors::Vector velocities(0);
   guess_constraints.close();
 
   const double nu = 0.01;
-  // Sparsità & matrice sella:
+ 
   SparsityPattern sp;
   {
     DynamicSparsityPattern dsp(dof_handler.n_dofs());
     DoFTools::make_sparsity_pattern(dof_handler, dsp, current_constraints, /*keep_constrained=*/true);
     sp.copy_from(dsp);
   }
-  SparseMatrix<double> K;   // [ M  B^T; B  0 ]
+  SparseMatrix<double> K;   
   K.reinit(sp);
   Vector<double> rhs(dof_handler.n_dofs());
   rhs = 0.0;
@@ -1074,7 +1074,7 @@ const FEValuesExtractors::Vector velocities(0);
     {
       const double JxW = fe_values.JxW(q);
 
-      // Muu
+      
       for (unsigned int iu=0; iu<n_u; ++iu)
       {
         const auto i_loc = u_pos[iu];
@@ -1089,11 +1089,11 @@ const FEValuesExtractors::Vector velocities(0);
           Muu(iu,ju) += (phi_i * phi_j) * JxW  +  nu * scalar_product(grad_i_u, grad_j_u) * JxW;;
         }
 
-        // f_u (solo sulle posizioni u): (M * u_interp)_i
+        
         fu(i_loc) += (phi_i * u_interp_vals[q]) * JxW;
       }
 
-      // B
+      
       for (unsigned int ip=0; ip<n_p; ++ip)
       {
         const auto p_loc = p_pos[ip];
@@ -1108,7 +1108,7 @@ const FEValuesExtractors::Vector velocities(0);
       }
     }
 
-    // Assembla [M B^T; B 0] e rhs = [f_u; 0]
+    
     FullMatrix<double> cell_mat(dofs_per_cell, dofs_per_cell);
     cell_mat = 0.0;
 
@@ -1120,8 +1120,8 @@ const FEValuesExtractors::Vector velocities(0);
       for (unsigned int ju=0; ju<n_u; ++ju)
       {
         const double Bij = Bpu(ip,ju);
-        cell_mat(p_pos[ip], u_pos[ju]) +=  Bij; // B
-        cell_mat(u_pos[ju], p_pos[ip]) +=  -Bij; // B^T
+        cell_mat(p_pos[ip], u_pos[ju]) +=  Bij; 
+        cell_mat(u_pos[ju], p_pos[ip]) +=  -Bij; 
       }
 
     Vector<double> cell_rhs(dofs_per_cell);
@@ -1132,14 +1132,14 @@ const FEValuesExtractors::Vector velocities(0);
     guess_constraints.distribute_local_to_global(cell_mat, cell_rhs, dof_indices, K, rhs);
   }
 
-  // Risolvi K * y_corr = rhs
+  
   SparseDirectUMFPACK direct;
   direct.initialize(K);
   Vector<double> y_corr(dof_handler.n_dofs());
   direct.vmult(y_corr, rhs);
 
   current_constraints.distribute(y_corr);
-  y = y_corr; // u aggiornato (e p corretto) sovrascrive y
+  y = y_corr; 
 }
 
 
